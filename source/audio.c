@@ -131,7 +131,14 @@ static int af_OpenURL(id url, int perms, uint32_t hint, audio_file **out) {
     const char *in = darwin_path(ns_cstr((id)MSG0(url, "path")), inb, sizeof(inb)); // X.app/ -> game_app/
     const char *path = try_ext(in, ".ogg", p, sizeof(p));
     audio_file *a = calloc(1, sizeof(*a));
-    if (path && !ov_fopen(path, &a->vf)) {
+    FILE *of = path ? fopen(path, "rb") : NULL;
+    if (of) // buffer de 64 KB: vorbisfile lee de a pedacitos y abrir m_menu.ogg en cada pausa costaba ~200 ms
+        setvbuf(of, NULL, _IOFBF, 64 * 1024);
+    if (of && ov_open(of, &a->vf, NULL, 0)) { // si falla, el FILE sigue siendo nuestro
+        fclose(of);
+        of = NULL;
+    }
+    if (of) { // ov_clear cierra el FILE
         vorbis_info *vi = ov_info(&a->vf, -1);
         a->kind = 1;
         a->channels = vi->channels;

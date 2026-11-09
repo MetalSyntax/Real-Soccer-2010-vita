@@ -47,6 +47,10 @@ static int nbinds;
 // STICK x y r: stick izquierdo / cruceta = dedo virtual arrastrado alrededor de (x,y) lógicos (pad táctil).
 static float pad_x, pad_y, pad_r;
 static int pad_down;
+// SHAKE <botón>: al apretarlo, una lectura del acelerómetro con un sacudón (saque de banda de Real Soccer 2010:
+// CTouchScreen::ParseThrowIn pide un cambio de ~0,92 g entre dos lecturas, imposible con el stick).
+static uint32_t shake_mask;
+static int shake_pending;
 #define PAD_FINGER (BTN_FINGER0 + MAX_BIND)
 
 static void load_controls(void) {
@@ -60,12 +64,17 @@ static void load_controls(void) {
     while (fgets(line, sizeof(line), f))
         if (sscanf(line, "STICK %f %f %f", &x, &y, &r) == 3)
             pad_x = x, pad_y = y, pad_r = r;
+        else if (sscanf(line, "SHAKE %31s", n) == 1) {
+            for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+                if (!strcmp(n, names[i].name))
+                    shake_mask = names[i].mask;
+        }
         else if (line[0] != '#' && nbinds < MAX_BIND && sscanf(line, "%31s %f %f", n, &x, &y) == 3)
             for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++)
                 if (!strcmp(n, names[i].name))
                     binds[nbinds++] = (typeof(binds[0])){names[i].mask, x, y};
     fclose(f);
-    l_info("controls.txt: %d botones%s", nbinds, pad_r > 0 ? " + STICK" : "");
+    l_info("controls.txt: %d botones%s%s", nbinds, pad_r > 0 ? " + STICK" : "", shake_mask ? " + SHAKE" : "");
 }
 
 void input_init(void) {
@@ -79,6 +88,12 @@ void input_init(void) {
         fclose(f);
     }
     load_controls();
+}
+
+int input_shake(void) {
+    int s = shake_pending;
+    shake_pending = 0;
+    return s;
 }
 
 void input_stick(float *x, float *y) {
@@ -161,6 +176,8 @@ void input_poll(void) {
     if (stick_y > -0.12f && stick_y < 0.12f)
         stick_y = 0;
     uint32_t b = pad.buttons, changed = b ^ prev_buttons;
+    if (changed & b & shake_mask)
+        shake_pending = 1;
     for (int i = 0; i < nbinds; i++) {
         if (!(changed & binds[i].mask))
             continue;

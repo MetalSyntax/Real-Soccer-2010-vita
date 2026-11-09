@@ -30,12 +30,14 @@ cmake_install.cmake
 eboot.bin
 *.vpk
 compile_commands.json
+.flags
 
 # Debugging en consola real
 /logs/
 *.log
 *.psp2dmp
 psp2core-*
+screenshots/
 
 # Python
 __pycache__/

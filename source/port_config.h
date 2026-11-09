@@ -12,3 +12,4 @@
 #define PORT_ACCEL_FROM_STICK 1        // stick izquierdo = inclinación del teléfono
 #define PORT_GL_DIAG 0               // sin capturas/trazados de GL (el 3D ya se verificó en la corrida 016)
 #define PORT_NATIVE_FIXED 0          // GL_FIXED convertido en CPU (como Real Soccer 2009); el nativo de vitaGL daba destellos
+#define PORT_FLASH_PROBE 0           // sonda de destellos del césped deshabilitada (resuelto en corrida 035)

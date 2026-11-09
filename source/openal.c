@@ -32,6 +32,16 @@ static ALCdevice *al_OpenDevice(const ALCchar *name) {
 // SoundEngine (Apple) llama alGetError justo después de alcOpenDevice, sin contexto: openal-soft da
 // AL_INVALID_OPERATION (0xA004) y el juego aborta el audio entero; iOS devuelve AL_NO_ERROR.
 static ALenum al_GetError(void) { return alcGetCurrentContext() ? alGetError() : AL_NO_ERROR; }
+// SoundEngineEffect::ClearSourceBuffers saca TODOS los buffers en cola de una fuente pausada; Apple lo
+// permite, openal-soft solo deja sacar los procesados (AL_INVALID_VALUE -> el juego reintenta cada frame
+// al entrar a la pausa). Se para la fuente primero: así todos quedan procesados.
+static void al_SourceUnqueueBuffers(ALuint src, ALsizei n, ALuint *bufs) {
+    ALint done = 0;
+    alGetSourcei(src, AL_BUFFERS_PROCESSED, &done);
+    if (n > done)
+        alSourceStop(src);
+    alSourceUnqueueBuffers(src, n, bufs);
+}
 
 const import_entry openal_imports[] = {
     D(alBufferData), D(alBufferf), D(alBufferi), D(alDeleteBuffers), D(alDeleteSources), D(alGenBuffers),
@@ -39,7 +49,7 @@ const import_entry openal_imports[] = {
     D(alGetSource3f), D(alGetBufferi), D(alGetBufferf), D(alListener3f), D(alListenerfv), D(alListenerf),
     D(alListeneri), D(alGetListenerf), D(alGetListenerfv), D(alGetListener3f), D(alSource3f), D(alSource3i),
     D(alSourcefv), D(alSourceiv), D(alSourcePause), D(alSourcePlay), D(alSourceQueueBuffers), D(alSourceRewind),
-    D(alSourceStop), D(alSourceUnqueueBuffers), D(alSourcef), D(alSourcei), D(alSourcePlayv), D(alSourceStopv),
+    D(alSourceStop), F(alSourceUnqueueBuffers, al_SourceUnqueueBuffers), D(alSourcef), D(alSourcei), D(alSourcePlayv), D(alSourceStopv),
     D(alSourcePausev), D(alSourceRewindv), D(alIsSource), D(alIsBuffer), D(alGetString), D(alGetInteger),
     D(alGetFloat), D(alGetBoolean), D(alDistanceModel), D(alDopplerFactor), D(alDopplerVelocity),
     D(alSpeedOfSound), D(alEnable), D(alDisable), D(alIsEnabled), D(alIsExtensionPresent), D(alGetEnumValue),

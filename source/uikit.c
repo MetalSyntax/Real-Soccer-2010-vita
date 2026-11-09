@@ -443,7 +443,7 @@ static void accel_tick(void) {
     default:
         a->x = gx, a->y = gy;
     }
-    a->z = gz;
+    a->z = gz - (input_shake() ? 2.0 : 0); // sacudón de 2 g en una sola lectura
     a->t = now;
     MSG2(acc_delegate, "accelerometer:didAccelerate:", accel_obj, a);
     objc_release(a);

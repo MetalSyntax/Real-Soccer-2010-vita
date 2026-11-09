@@ -57,7 +57,14 @@ typedef struct {
 enum { A_VTX, A_NRM, A_COL, A_TC0, A_TC1, A_N };
 static array_ptr arr[A_N];
 static int client_unit;
-static GLint env_mode = GL_MODULATE;
+// GL_TEXTURE_ENV_MODE por unidad de textura: gles_present pisa la 0 y la restaura (el césped usa COMBINE en la 1).
+static GLint env_mode[2] = {GL_MODULATE, GL_MODULATE};
+// ponytail: interruptores de bisección (ux0:data/<slug>/gldbg.txt, número; corrida 023 de Real Soccer 2010: destellos y
+// campo negro desde las corridas 021-022). 1 = convertir desde el vértice 0, 2 = convertir aunque el array esté
+// deshabilitado, 4 = env_mode único (el último fijado), 8 = unidad 1 sin GL_COMBINE. Quitar al cerrar el bug.
+static int gl_dbg;
+static int server_unit;
+static GLint env_last = GL_MODULATE;
 static GLfixed color[4] = {0x10000, 0x10000, 0x10000, 0x10000};
 static GLuint bound_array_buffer, bound_element_buffer;
 
@@ -130,7 +137,8 @@ static void g_glDeleteBuffers(GLsizei n, const GLuint *ids) {
 static float *conv_buf[A_N];
 static int conv_cap[A_N];
 
-static const void *fixed_to_float(const array_ptr *a, int n, int slot) {
+// Solo convierte los vértices [lo, n) que usa el draw; el resto del búfer queda sin tocar.
+static const void *fixed_to_float(const array_ptr *a, int lo, int n, int slot) {
     int need = n * a->size;
     if (need > conv_cap[slot]) {
         conv_buf[slot] = realloc(conv_buf[slot], need * sizeof(float));
@@ -141,7 +149,9 @@ static const void *fixed_to_float(const array_ptr *a, int n, int slot) {
         return NULL;
     int stride = a->stride ? a->stride : a->size * 4;
     float *dst = conv_buf[slot];
-    for (int i = 0; i < n; i++) {
+    if (gl_dbg & 1)
+        lo = 0;
+    for (int i = lo; i < n; i++) {
         const int32_t *src = (const int32_t *)(base + i * stride);
         for (int c = 0; c < a->size; c++)
             dst[i * a->size + c] = src[c] * (1.0f / 65536.0f);
@@ -154,7 +164,10 @@ static const void *fixed_to_float(const array_ptr *a, int n, int slot) {
 #define PORT_NATIVE_FIXED 1 // port_config.h: 0 = convertir todo en CPU (Real Soccer 2010: destellos y saltos de color
 #endif                      // con el nativo; allá la conversión cuesta < 2 ms/frame)
 #define NEEDS_CONV(k) (arr[k].size && arr[k].type == GL_FIXED && (!PORT_NATIVE_FIXED || (k) == A_COL))
-static void set_pointer(int k, int n) {
+// Arrays habilitados (glEnableClientState): convertir uno deshabilitado es trabajo perdido y lee punteros viejos.
+static uint8_t cl_on[A_N];
+#define DRAW_CONV(k) (((gl_dbg & 2) || cl_on[k]) && NEEDS_CONV(k))
+static void set_pointer(int k, int lo, int n) {
     array_ptr *a = &arr[k];
     if (!a->size)
         return;
@@ -165,7 +178,7 @@ static void set_pointer(int k, int n) {
     if (NEEDS_CONV(k)) {
         if (!n)
             return; // se convierte al dibujar
-        p = fixed_to_float(a, n, k);
+        p = fixed_to_float(a, lo, n, k);
         type = GL_FLOAT;
         stride = 0;
         unbind = 1; // puntero de CPU: sin VBO ligado
@@ -197,29 +210,29 @@ static void set_pointer(int k, int n) {
 
 static void g_glVertexPointer(GLint size, GLenum type, GLsizei stride, const void *ptr) {
     arr[A_VTX] = (array_ptr){size, type, stride, ptr, bound_array_buffer};
-    set_pointer(A_VTX, 0);
+    set_pointer(A_VTX, 0, 0);
 }
 static void g_glNormalPointer(GLenum type, GLsizei stride, const void *ptr) {
     arr[A_NRM] = (array_ptr){3, type, stride, ptr, bound_array_buffer};
-    set_pointer(A_NRM, 0);
+    set_pointer(A_NRM, 0, 0);
 }
 static void g_glColorPointer(GLint size, GLenum type, GLsizei stride, const void *ptr) {
     arr[A_COL] = (array_ptr){size, type, stride, ptr, bound_array_buffer};
-    set_pointer(A_COL, 0);
+    set_pointer(A_COL, 0, 0);
 }
 static void g_glTexCoordPointer(GLint size, GLenum type, GLsizei stride, const void *ptr) {
     arr[A_TC0 + client_unit] = (array_ptr){size, type, stride, ptr, bound_array_buffer};
-    set_pointer(A_TC0 + client_unit, 0);
+    set_pointer(A_TC0 + client_unit, 0, 0);
 }
 static void g_glClientActiveTexture(GLenum unit) {
     client_unit = (unit - GL_TEXTURE0) & 1;
     glClientActiveTexture(unit);
 }
 
-static void convert_fixed(int n) {
+static void convert_fixed(int lo, int n) {
     for (int k = 0; k < A_N; k++)
-        if (NEEDS_CONV(k))
-            set_pointer(k, n);
+        if (DRAW_CONV(k))
+            set_pointer(k, lo, n);
 }
 
 static uint32_t draw_calls;
@@ -246,10 +259,24 @@ static void e_glFogfv(GLenum p, const GLfloat *v) { glFogfv(p, v); chk("glFogfv"
 static void e_glMaterialf(GLenum f, GLenum p, GLfloat v) { glMaterialf(f, p, v); chk("glMaterialf", f, p); }
 static void e_glMaterialfv(GLenum f, GLenum p, const GLfloat *v) { glMaterialfv(f, p, v); chk("glMaterialfv", f, p); }
 static void e_glLightfv(GLenum l, GLenum p, const GLfloat *v) { glLightfv(l, p, v); chk("glLightfv", l, p); }
-static void e_glTexEnvfv(GLenum t, GLenum p, const GLfloat *v) { glTexEnvfv(t, p, v); chk("glTexEnvfv", t, p); }
+// ponytail: rango del alfa de TEXTURE_ENV_COLOR (césped de Real Soccer 2010: INTERPOLATE por CONSTANT.a; fuera de
+// [0,1] extrapola → ¿destellos?, corrida 022). Sale en la línea PERF. Quitar al resolver los destellos.
+static float envc_min = 1e9f, envc_max = -1e9f;
+static unsigned envc_n;
+static void e_glTexEnvfv(GLenum t, GLenum p, const GLfloat *v) {
+    if (p == GL_TEXTURE_ENV_COLOR) {
+        envc_n++;
+        if (v[3] < envc_min || v[3] != v[3])
+            envc_min = v[3];
+        if (v[3] > envc_max)
+            envc_max = v[3];
+    }
+    glTexEnvfv(t, p, v);
+    chk("glTexEnvfv", t, p);
+}
 static void e_glGetFloatv(GLenum p, GLfloat *v) { glGetFloatv(p, v); chk("glGetFloatv", p, 0); }
 static void e_glBindTexture(GLenum t, GLuint id) { glBindTexture(t, id); chk("glBindTexture", t, id); }
-static void e_glActiveTexture(GLenum t) { glActiveTexture(t); chk("glActiveTexture", t, 0); }
+static void e_glActiveTexture(GLenum t) { server_unit = (t - GL_TEXTURE0) & 1; glActiveTexture(t); chk("glActiveTexture", t, 0); }
 
 // ponytail: trazado de UN frame (corrida 011: pantalla entera blanca con alfa 0). Quitar al verse bien.
 static int trace_frame, trace_n, trace_max = 40;
@@ -311,7 +338,7 @@ static void trace_draw(const char *fn, GLenum mode, int count, int first) {
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
     l_info("TRACE   vp %d %d %d %d | scissor %d (%d %d %d %d) | fb %d | col %d x 0x%X st %d | env 0x%X", vp[0], vp[1],
            vp[2], vp[3], glIsEnabled(GL_SCISSOR_TEST), sc[0], sc[1], sc[2], sc[3], fb, arr[A_COL].size, arr[A_COL].type,
-           arr[A_COL].stride, env_mode);
+           arr[A_COL].stride, env_mode[server_unit]);
     l_info("TRACE %s mode %d n %d | vtx %d x 0x%X st %d vbo %u v0 (%.2f %.2f %.2f) | col %s tc0 %d x 0x%X | tex %d "
            "T%d B%d A%d D%d C%d L%d | rgba %.2f %.2f %.2f %.2f | P %.3f %.3f %.3f %.3f | M %.2f %.2f %.2f %.2f "
            "| err 0x%X",
@@ -322,10 +349,175 @@ static void trace_draw(const char *fn, GLenum mode, int count, int first) {
            pm[12], mv[0], mv[5], mv[12], mv[13], err0);
 }
 
+
+#ifndef PORT_FLASH_PROBE
+#define PORT_FLASH_PROBE 0
+#endif
+// ponytail: sonda de destellos (Real Soccer 2010, corridas 028-033: cuadros tapados por un color de jugador).
+// Registra cada draw en perspectiva del cuadro (puntero y rango de vértices, caja envolvente en espacio objeto,
+// traslación de la modelview, textura). gles_present lee una fila del FBO; si un cuadro sin verde sigue a uno con
+// verde (destello), vuelca el cuadro anterior y el del destello para ver qué draw cambió. Quitar al resolverlo.
+#define DREC_MAX 200
+typedef struct {
+    const void *ptr;
+    int count, lo, hi;
+    GLenum vtype, mode;
+    GLint tex;
+    float bmin[3], bmax[3], mv[16], pm[16];
+} drec;
+static drec drecs[2][DREC_MAX];
+static int ndrec[2], drec_cur;
+static void draw_rec(GLenum mode, int count, int lo, int hi) {
+    if (!PORT_FLASH_PROBE || ndrec[drec_cur] >= DREC_MAX)
+        return;
+    float pm[16];
+    glGetFloatv(GL_PROJECTION_MATRIX, pm);
+    if (pm[11] > -0.5f) // ortográfica (HUD, menús)
+        return;
+    drec *d = &drecs[drec_cur][ndrec[drec_cur]++];
+    const array_ptr *a = &arr[A_VTX];
+    *d = (drec){a->ptr, count, lo, hi, a->type, mode, 0, {1e9f, 1e9f, 1e9f}, {-1e9f, -1e9f, -1e9f}};
+    memcpy(d->pm, pm, sizeof(pm));
+    glGetFloatv(GL_MODELVIEW_MATRIX, d->mv);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &d->tex);
+    const uint8_t *base = a->vbo ? (const uint8_t *)vbo_data(a->vbo) + (uintptr_t)a->ptr : a->ptr;
+    int ts = a->type == GL_SHORT ? 2 : a->type == GL_BYTE ? 1 : 4, stride = a->stride ? a->stride : a->size * ts;
+    for (int i = lo; base && i < hi; i++)
+        for (int c = 0; c < 3 && c < a->size; c++) {
+            const uint8_t *e = base + i * stride + c * ts;
+            float v = a->type == GL_FIXED ? *(const int32_t *)e / 65536.0f
+                    : a->type == GL_FLOAT ? *(const float *)e
+                    : a->type == GL_SHORT ? *(const int16_t *)e : *(const int8_t *)e;
+            if (v < d->bmin[c])
+                d->bmin[c] = v;
+            if (v > d->bmax[c])
+                d->bmax[c] = v;
+        }
+}
+static int mat_diff(const float *a, const float *b) {
+    for (int i = 0; i < 16; i++) {
+        float d = a[i] - b[i];
+        if (d * d > 0.01f * (1 + a[i] * a[i]))
+            return 1;
+    }
+    return 0;
+}
+static void mat_log(const char *tag, const float *m) {
+    l_info("      %s [%.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f]", tag, m[0], m[1],
+           m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]);
+}
+// Draws del destello cuya matriz (o caja) cambió > 10 % respecto del mismo draw del cuadro anterior.
+static void drec_dump(int f) {
+    const drec *pa = drecs[f ^ 1];
+    int np = ndrec[f ^ 1], shown = 0;
+    l_info("  %d draws en perspectiva (anterior %d)", ndrec[f], np);
+    for (int i = 0; i < ndrec[f] && shown < 25; i++) {
+        const drec *d = &drecs[f][i], *p = NULL;
+        for (int j = 0; j < np && !p; j++)
+            if (pa[j].ptr == d->ptr && pa[j].lo == d->lo && pa[j].hi == d->hi && pa[j].tex == d->tex)
+                p = &pa[j];
+        int dm = !p || mat_diff(p->mv, d->mv), dp = !p || mat_diff(p->pm, d->pm);
+        if (!dm && !dp)
+            continue;
+        shown++;
+        l_info("   %3d %p m%d n%d [%d,%d) t0x%X tex%d caja (%.1f %.1f %.1f)-(%.1f %.1f %.1f)%s", i, d->ptr, d->mode,
+               d->count, d->lo, d->hi, d->vtype, d->tex, d->bmin[0], d->bmin[1], d->bmin[2], d->bmax[0], d->bmax[1],
+               d->bmax[2], p ? "" : " (nuevo)");
+        if (dm) {
+            if (p)
+                mat_log("M antes", p->mv);
+            mat_log("M ahora", d->mv);
+        }
+        if (dp) {
+            if (p)
+                mat_log("P antes", p->pm);
+            mat_log("P ahora", d->pm);
+        }
+    }
+}
+// Imagen reducida a 160x240 (TGA de 150 KB: escribir 600 KB dos veces disparó el watchdog en la corrida 017).
+static void flash_tga(const char *name, int run, const uint8_t *px) {
+    char path[128];
+    snprintf(path, sizeof(path), LOGS_PATH "%s_%d.tga", name, run);
+    FILE *f = fopen(path, "wb");
+    if (!f)
+        return;
+    uint8_t h[18] = {0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 160, 0, 240, 0, 32, 8};
+    fwrite(h, 1, 18, f); // de abajo hacia arriba = mismo orden que glReadPixels
+    fwrite(px, 4, 160 * 240, f);
+    fclose(f);
+    l_info("  captura %s", path);
+}
+static void flash_check(void) {
+    static int prev_green, nflash, run;
+    static uint8_t full[480][320][4], small[2][240 * 160 * 4];
+    if (!PORT_FLASH_PROBE)
+        return;
+    if (!run)
+        run = (int)(sceKernelGetProcessTimeWide() % 100000);
+    int had3d = ndrec[drec_cur] > 0, green = 0;
+    if (had3d) {
+        // una sola lectura por cuadro: en vitaGL cada glReadPixels del FBO en uso fuerza scene_reset + sceGxmFinish
+        // (corrida 030: con 4 por cuadro se colgó).
+        glReadPixels(0, 0, 320, 480, GL_RGBA, GL_UNSIGNED_BYTE, full);
+        uint8_t *sm = small[drec_cur];
+        for (int y = 0; y < 240; y++)
+            for (int x = 0; x < 160; x++) {
+                const uint8_t *p = full[y * 2][x * 2];
+                uint8_t *q = sm + (y * 160 + x) * 4;
+                q[0] = p[2], q[1] = p[1], q[2] = p[0], q[3] = 255; // RGBA -> BGRA
+            }
+        // fila central del FBO = línea vertical por el centro de la pantalla
+        for (int i = 0; i < 320; i += 10)
+            green += full[240][i][1] > full[240][i][0] && full[240][i][1] > full[240][i][2];
+        if (green < 4 && prev_green && nflash++ < 8) {
+            l_info("FLASH %d: fila %02x%02x%02x %02x%02x%02x %02x%02x%02x", nflash, full[240][40][0], full[240][40][1],
+                   full[240][40][2], full[240][160][0], full[240][160][1], full[240][160][2], full[240][280][0],
+                   full[240][280][1], full[240][280][2]);
+            drec_dump(drec_cur);
+            if (nflash <= 4) {
+                char name[32];
+                snprintf(name, sizeof(name), "flash%d_antes", nflash);
+                flash_tga(name, run, small[drec_cur ^ 1]);
+                snprintf(name, sizeof(name), "flash%d", nflash);
+                flash_tga(name, run, small[drec_cur]);
+            }
+        }
+    }
+    prev_green = had3d && green >= 4;
+    drec_cur ^= 1;
+    ndrec[drec_cur] = 0;
+}
+
+// Corrida 035: protección contra destellos por overflow de escala/huesos en ModelView 3D
+// (DrawPlayerShadow y DrawSkin desbordan a escala > 1800..60000; el límite legítimo es 2.32).
+static inline int is_perspective_3d_exploded(void) {
+    float pm[16];
+    glGetFloatv(GL_PROJECTION_MATRIX, pm);
+    if (pm[11] > -0.5f) // ortográfica (HUD, menús 2D)
+        return 0;
+    float mv[16];
+    glGetFloatv(GL_MODELVIEW_MATRIX, mv);
+    static const int rot_idx[9] = {0, 1, 2, 4, 5, 6, 8, 9, 10};
+    for (int i = 0; i < 9; i++) {
+        float v = mv[rot_idx[i]];
+        if (fabsf(v) > 16.0f || !isfinite(v))
+            return 1;
+    }
+    return 0;
+}
+
 static void g_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
+    if (is_perspective_3d_exploded()) {
+        static int nsupp;
+        if (nsupp++ < 20)
+            l_info("WARN: draw suprimido por ModelView 3D desbordada (DrawArrays, draw %u)", draw_calls);
+        return;
+    }
     trace_draw("DrawArrays", mode, count, first);
     draw_calls++;
-    PROF(P_CONV, convert_fixed(first + count));
+    PROF(P_CONV, convert_fixed(first, first + count));
+    draw_rec(mode, count, first, first + count);
     int skinned;
     PROF(P_SKIN, skinned = skin(first + count));
     PROF(P_DRAW, glDrawArrays(mode, first, count));
@@ -334,22 +526,31 @@ static void g_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
 }
 
 static void g_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *idx) {
+    if (is_perspective_3d_exploded()) {
+        static int nsupp;
+        if (nsupp++ < 20)
+            l_info("WARN: draw suprimido por ModelView 3D desbordada (DrawElements, draw %u)", draw_calls);
+        return;
+    }
     trace_draw("DrawElements", mode, count, 0);
     draw_calls++;
     extern int palette_active(void);
     int need_fixed = palette_active();
     for (int k = 0; k < A_N; k++)
-        need_fixed |= NEEDS_CONV(k);
-    int maxi = 0;
+        need_fixed |= DRAW_CONV(k);
+    int maxi = 0, mini = 0xffff;
     if (need_fixed) {
         const void *ip = bound_element_buffer ? (const uint8_t *)vbo_data(bound_element_buffer) + (uintptr_t)idx : idx;
         for (int i = 0; ip && i < count; i++) {
             int v = type == GL_UNSIGNED_BYTE ? ((const uint8_t *)ip)[i] : ((const uint16_t *)ip)[i];
             if (v > maxi)
                 maxi = v;
+            if (v < mini)
+                mini = v;
         }
-        PROF(P_CONV, convert_fixed(maxi + 1));
+        PROF(P_CONV, convert_fixed(mini > maxi ? 0 : mini, maxi + 1));
     }
+    draw_rec(mode, count, mini > maxi ? 0 : mini, maxi + 1);
     int skinned;
     PROF(P_SKIN, skinned = skin(maxi + 1));
     PROF(P_DRAW, glDrawElements(mode, count, type, idx));
@@ -371,8 +572,10 @@ static void g_glColor4ub(GLubyte r, GLubyte g, GLubyte b, GLubyte a) {
     g_glColor4f(r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
 }
 static void g_glTexEnvi(GLenum target, GLenum pname, GLint v) {
+    if (pname == GL_TEXTURE_ENV_MODE && (gl_dbg & 8) && server_unit == 1 && v == GL_COMBINE)
+        v = GL_MODULATE;
     if (pname == GL_TEXTURE_ENV_MODE)
-        env_mode = v;
+        env_mode[server_unit] = env_last = v;
     glTexEnvi(target, pname, v);
     chk("glTexEnvi", pname, v);
 }
@@ -479,21 +682,69 @@ static void g_glLoadMatrixf(const GLfloat *m) {
     if (trace_frame && trace_n < 40)
         l_info("TRACE LoadMatrixf [%.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f]",
                m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]);
+    if (real_matrix_mode == GL_MODELVIEW) {
+        static const int rot_idx[9] = {0, 1, 2, 4, 5, 6, 8, 9, 10};
+        for (int i = 0; i < 9; i++) {
+            float v = m[rot_idx[i]];
+            if (fabsf(v) > 16.0f || !isfinite(v)) {
+                static int nbad;
+                if (nbad++ < 20)
+                    l_info("WARN: glLoadMatrixf ignorada por elemento desbordado (idx %d: %f)", rot_idx[i], v);
+                return;
+            }
+        }
+    }
     if (!palette_mode)
         return glLoadMatrixf(m);
     memcpy(palette[cur_palette], m, 16 * sizeof(float));
 }
 static void g_glLoadMatrixx(const GLfixed *m) {
+    if (real_matrix_mode == GL_MODELVIEW) {
+        static const int rot_idx[9] = {0, 1, 2, 4, 5, 6, 8, 9, 10};
+        for (int i = 0; i < 9; i++) {
+            int32_t v = m[rot_idx[i]];
+            if (v < -1048576 || v > 1048576) {
+                static int nbad;
+                if (nbad++ < 20)
+                    l_info("WARN: glLoadMatrixx ignorada por elemento desbordado (idx %d: %d)", rot_idx[i], (int)v);
+                return;
+            }
+        }
+    }
     if (!palette_mode)
         return glLoadMatrixx(m);
     fx_to_f(m, palette[cur_palette]);
 }
 static void g_glMultMatrixf(const GLfloat *m) {
+    if (real_matrix_mode == GL_MODELVIEW) {
+        static const int rot_idx[9] = {0, 1, 2, 4, 5, 6, 8, 9, 10};
+        for (int i = 0; i < 9; i++) {
+            float v = m[rot_idx[i]];
+            if (fabsf(v) > 16.0f || !isfinite(v)) {
+                static int nbad;
+                if (nbad++ < 20)
+                    l_info("WARN: glMultMatrixf suprimida por elemento desbordado (idx %d: %f)", rot_idx[i], v);
+                return;
+            }
+        }
+    }
     if (!palette_mode)
         return glMultMatrixf(m);
     pal_mult(m);
 }
 static void g_glMultMatrixx(const GLfixed *m) {
+    if (real_matrix_mode == GL_MODELVIEW) {
+        static const int rot_idx[9] = {0, 1, 2, 4, 5, 6, 8, 9, 10};
+        for (int i = 0; i < 9; i++) {
+            int32_t v = m[rot_idx[i]];
+            if (v < -1048576 || v > 1048576) {
+                static int nbad;
+                if (nbad++ < 20)
+                    l_info("WARN: glMultMatrixx suprimida por elemento desbordado (idx %d: %d)", rot_idx[i], (int)v);
+                return;
+            }
+        }
+    }
     if (!palette_mode)
         return glMultMatrixx(m);
     float f[16];
@@ -508,6 +759,15 @@ static void g_glTranslatef(GLfloat x, GLfloat y, GLfloat z) {
 }
 static void g_glTranslatex(GLfixed x, GLfixed y, GLfixed z) { g_glTranslatef(x / 65536.0f, y / 65536.0f, z / 65536.0f); }
 static void g_glScalef(GLfloat x, GLfloat y, GLfloat z) {
+    if (fabsf(x) > 16.0f || fabsf(y) > 16.0f || fabsf(z) > 16.0f ||
+        !isfinite(x) || !isfinite(y) || !isfinite(z)) {
+        static int nbad;
+        if (nbad++ < 20)
+            l_info("WARN: glScalef acotada por desborde (%.1f, %.1f, %.1f)", x, y, z);
+        if (!isfinite(x) || fabsf(x) > 16.0f) x = (x < 0) ? -16.0f : 16.0f;
+        if (!isfinite(y) || fabsf(y) > 16.0f) y = (y < 0) ? -16.0f : 16.0f;
+        if (!isfinite(z) || fabsf(z) > 16.0f) z = (z < 0) ? -16.0f : 16.0f;
+    }
     if (!palette_mode)
         return glScalef(x, y, z);
     const float t[16] = {x, 0, 0, 0, 0, y, 0, 0, 0, 0, z, 0, 0, 0, 0, 1};
@@ -550,8 +810,22 @@ static void g_glPopMatrix(void) {
     if (palette_mode)
         return;
     int s = mstack_idx();
-    if (mdepth[s] > 0)
-        glLoadMatrixf(mstack[s][--mdepth[s]]);
+    if (mdepth[s] > 0) {
+        float *m = mstack[s][--mdepth[s]];
+        if (s == 0) { // ModelView
+            static const int rot_idx[9] = {0, 1, 2, 4, 5, 6, 8, 9, 10};
+            for (int i = 0; i < 9; i++) {
+                float v = m[rot_idx[i]];
+                if (fabsf(v) > 16.0f || !isfinite(v)) {
+                    static int nbad;
+                    if (nbad++ < 20)
+                        l_info("WARN: matriz desbordada en mstack corregida al hacer glPopMatrix (idx %d: %f)", rot_idx[i], v);
+                    m[rot_idx[i]] = (v < 0) ? -1.0f : 1.0f;
+                }
+            }
+        }
+        glLoadMatrixf(m);
+    }
 }
 static void g_glCurrentPaletteMatrixOES(GLuint i) { cur_palette = i < MAX_PALETTE ? i : 0; }
 static void g_glLoadPaletteFromModelViewMatrixOES(void) { glGetFloatv(GL_MODELVIEW_MATRIX, palette[cur_palette]); }
@@ -645,8 +919,8 @@ static void unskin(void) {
     glMatrixMode(GL_MODELVIEW);
     glPopMatrix();
     glMatrixMode(real_matrix_mode);
-    set_pointer(A_VTX, 0);
-    set_pointer(A_NRM, 0);
+    set_pointer(A_VTX, 0, 0);
+    set_pointer(A_NRM, 0, 0);
 }
 
 int palette_active(void) { return palette_on && mi_on && wt_on; }
@@ -666,11 +940,17 @@ static void g_glDisable(GLenum cap) {
     glDisable(cap);
     chk("glDisable", cap, 0);
 }
+static int client_slot(GLenum a) {
+    return a == GL_VERTEX_ARRAY ? A_VTX : a == GL_NORMAL_ARRAY ? A_NRM : a == GL_COLOR_ARRAY ? A_COL
+         : a == GL_TEXTURE_COORD_ARRAY ? A_TC0 + client_unit : -1;
+}
 static void g_glEnableClientState(GLenum a) {
     if (a == 0x8844 /* MATRIX_INDEX_ARRAY */ || a == 0x86AD /* WEIGHT_ARRAY */) {
         *(a == 0x8844 ? &mi_on : &wt_on) = 1;
         return;
     }
+    if (client_slot(a) >= 0)
+        cl_on[client_slot(a)] = 1;
     glEnableClientState(a);
     chk("glEnableClientState", a, 0);
 }
@@ -679,6 +959,8 @@ static void g_glDisableClientState(GLenum a) {
         *(a == 0x8844 ? &mi_on : &wt_on) = 0;
         return;
     }
+    if (client_slot(a) >= 0)
+        cl_on[client_slot(a)] = 0;
     glDisableClientState(a);
     chk("glDisableClientState", a, 0);
 }
@@ -851,6 +1133,13 @@ void gles_set_size(int w, int h) {
 }
 
 void gles_init(void) {
+    FILE *dbg = fopen(DATA_PATH "gldbg.txt", "r");
+    if (dbg) {
+        if (fscanf(dbg, "%i", &gl_dbg) != 1)
+            gl_dbg = 0;
+        fclose(dbg);
+        l_info("gldbg.txt: %d", gl_dbg);
+    }
     vglUseTripleBuffering(GL_FALSE);
     vglInitExtended(0, SCR_W, SCR_H, GLES_POOL_MB * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
     gles_set_size(fb_w, fb_h);
@@ -971,6 +1260,7 @@ void gles_present(void) {
     if (bound_element_buffer)
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
 
+    flash_check();
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glViewport(0, 0, SCR_W, SCR_H);
     for (int i = 0; i < NCAPS - 1; i++)
@@ -1022,6 +1312,9 @@ void gles_present(void) {
                prof[P_DRAW] / 1e3 / f, (unsigned)(prof_n[P_DRAW] / f), prof[P_BUF] / 1e3 / f, (unsigned)(prof_n[P_BUF] / f),
                (unsigned)(prof_bytes / 1024 / f), prof[P_TEX] / 1e3 / f, (unsigned)(prof_n[P_TEX] / f), prof[P_SWAP] / 1e3 / f,
                tot - (prof[P_CONV] + prof[P_SKIN] + prof[P_DRAW] + prof[P_BUF] + prof[P_TEX] + prof[P_SWAP]) / 1e3 / f);
+        if (envc_n)
+            l_info("ENVCOLOR alfa %g .. %g (%u llamadas)", envc_min, envc_max, envc_n);
+        envc_min = 1e9f, envc_max = -1e9f, envc_n = 0;
         memset(prof, 0, sizeof(prof)), memset(prof_n, 0, sizeof(prof_n)), prof_bytes = 0;
         prof_frames = 0, prof_t0 = now_us();
     }
@@ -1035,7 +1328,7 @@ void gles_present(void) {
     bind_fb(cur_fb);
     glViewport(vp[0], vp[1], vp[2], vp[3]);
     glBindTexture(GL_TEXTURE_2D, tex);
-    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, env_mode);
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, (gl_dbg & 4) ? env_last : env_mode[0]);
     for (int i = 0; i < NCAPS; i++)
         on[i] ? glEnable(caps[i]) : glDisable(caps[i]);
     if (!va)
@@ -1053,7 +1346,7 @@ void gles_present(void) {
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, bound_element_buffer);
     for (int k = 0; k < A_N; k++)
         if (!NEEDS_CONV(k))
-            set_pointer(k, 0);
+            set_pointer(k, 0, 0);
     glClientActiveTexture(GL_TEXTURE0 + client_unit);
     glActiveTexture(active);
 }

@@ -164,3 +164,149 @@ Un revisor aparte leyó asm.S/objc.c/macho.c. Se corrigió:
   Zonas del partido leídas de `CTouchScreen::GetTouchType` (tabla en 0x250160): pad = mitad izquierda, A (330,272),
   B (430,272), arriba-derecha (404,20)/(450,20). controls.txt: CROSS=B, SQUARE=A, CIRCLE=atrás, TRIANGLE/R=arriba-der.,
   START=centro, STICK 80 240 55.
+
+### Corrida 019 (consola) — crash ~30 s de partido: trayectoria de la pelota desbordada
+- Data abort en `CFormationPool::Update` (0x3c2dc): `CFootBall::GetCapture()` (+0x1654) = 0xffff7f03 (basura).
+- Memoria del dump: el arreglo de trayectoria `ball+0x68` (300 × M3DXVector3) tenía 850 cuadros (+0x113c = 850):
+  velocidad 43285, desaceleración 51/cuadro → pisó contador (+0x1134), posición (+0x1614) y capture (+0x1654).
+- Escritor: `CFootBall::SetBallOutTo_Reflect` (0x39d04), único `SetBallOutTo_*` cuyo tope de 299 cuadros depende de un
+  flag (`[sp+0xc]`); los demás comparan siempre contra 300. Parche en patch.c: nop en 0x3a184 y `bne`→`blt` en 0x3a190
+  (corta al llegar a 299 cuadros con la pelota en el piso). Pendiente: quién pasa una velocidad tan alta.
+- Stick/cruceta sin efecto: el `controls.txt` de la Vita era viejo ("4 botones", sin `STICK`). Subido el actual.
+- Rendimiento: el juego se programa a 30 fps (NSTimer 0.0303 s); los bajones del partido coinciden con `conv`
+  10-17 ms/frame. gles.c: (1) solo se convierte el rango de vértices del draw ([first, first+count) o
+  [min, max] de índices), (2) solo arrays habilitados (`cl_on`: antes se convertía el array de color viejo aunque
+  `CM3DDevice2::DrawDisplayList` lo deshabilita en cada draw). Pendiente: llevar a la maestra.
+- Franja negra abajo en el partido: es `CPlayGround::RenderCameraBigShadow` (0x94240): `Camera_big_shadow.gtx`
+  con glColor4f(0,0,0,0.5) + GL_BLEND, cull off; debería oscurecer 50 % y sale negra sólida. Sonda `SOMBRA` en
+  gles.c (blend func, env, formato de la textura, arrays) para la próxima corrida.
+
+### Corrida 021 (consola) — franja negra resuelta, FPS mejores; quedan destellos blancos en el césped
+- Sonda SOMBRA: estado de la sombra de tribuna correcto (SRC_ALPHA/1-SRC_ALPHA, MODULATE, RGBA4444). La franja negra
+  desapareció con el filtro de arrays deshabilitados (`cl_on`). Sonda quitada.
+- Césped (`CPlayGround::DrawMultiTextureDL`, 0x943xx): unidad 1 en GL_COMBINE / INTERPOLATE(TEXTURE, PREVIOUS,
+  CONSTANT.a) con TEXTURE_ENV_COLOR por draw. Bug en gles.c: `env_mode` era uno solo para ambas unidades → cada
+  gles_present dejaba la unidad 0 en COMBINE (el último modo, de la unidad 1). Ahora `env_mode[2]` por unidad
+  (`server_unit` desde glActiveTexture). Candidato a los destellos; sin confirmar.
+- Audio: portados de Real Soccer 2009 `al_SourceUnqueueBuffers` (alSourceStop antes del unqueue, openal.c) y
+  `ov_open` + setvbuf 64 KB (audio.c). Queda: cada SFX se relee de ux0 al sonar (wav de hasta 500 KB, p. ej.
+  sfx_busy_crowd_1) → posible tirón; cachear si persiste.
+
+### Corrida 022 (consola) — siguen destellos blancos/rojos/naranjas; estadio negro al empezar el partido
+- Esta corrida fue la primera sin `SAMPLERS_SPEEDHACK=1 DRAW_SPEEDHACK=2` en vitaGL (CMakeLists editado a mano a las
+  12:05) y con `env_mode` por unidad. Flags restaurados (como RS2009, que se ve limpio) para aislar el estadio negro.
+- Destellos: sin paleta de matrices (el juego no importa glCurrentPaletteMatrixOES) → no es skinning nuestro. Lo
+  nuevo de RS2010 frente a RS2009 es el césped multitextura (GL_COMBINE/INTERPOLATE con CONSTANT.a); la fórmula y
+  los uniforms del combinador de vitaGL están bien. Sonda `ENVCOLOR alfa min .. max` junto a PERF: si el alfa de
+  TEXTURE_ENV_COLOR sale de [0,1], el INTERPOLATE extrapola (colores saturados).
+- gles.c sincronizado a la maestra (Ferrari-GT-Evolution-vita), con la sonda ENVCOLOR.
+
+### Corrida 023 (consola) — siguen destellos y campo negro al empezar el partido
+- `ENVCOLOR alfa 0 .. 1` siempre: el combinador del césped no extrapola. Con speedhacks restaurados el campo
+  negro sigue → no eran los flags de vitaGL.
+- Sospecha de regresión propia: destellos reportados desde la 021 (rango + cl_on), campo negro desde la 022
+  (env_mode por unidad). Interruptores en `ux0:data/realsoccer10/gldbg.txt` (se lee en gles_init, sale en el log):
+  1 = convertir desde el vértice 0, 2 = convertir arrays deshabilitados, 4 = env_mode único, 8 = unidad 1 sin
+  COMBINE. Corrida 024 con 7 (comportamiento de la 019).
+
+### Corrida 024 (consola, gldbg 7) — siguen los errores gráficos; la zona oscura se reconoce como la sombra del estadio
+- El log no tiene errores nuevos (solo los GLERR de focos ya conocidos). `RenderCameraBigShadow` (0x94240) solo hace
+  glColor4f(0,0,0,0.5) + glEnable(GL_BLEND) + 2× DrawDisplayList: con alfa 0.5 no puede quedar negro opaco
+  (captura de las 11:04: debajo del degradado todo es negro). O la sombra se mezcla mal, o el césped/estadio de esa
+  zona no se dibuja y lo que se ve es el color de borrado.
+- Bisección: patch.c lee `gldbg.txt` y con el bit 16 pone `bx lr` en 0x94240. Corrida 025 con gldbg 23 (7 + 16):
+  si lo negro desaparece → el problema es la sombra; si sigue → falta geometría del césped/estadio.
+
+### Corrida 025 (consola) — en la Vita seguía gldbg 7: la prueba de la sombra no se hizo
+- El log dice `gldbg.txt: 7` y falta `patch: RenderCameraBigShadow anulado` → no se había subido el 23. Subido
+  después con deploy_data.py; la corrida 026 repite la prueba.
+- Observación: la presentación (estadio y jugadores entrando) se ve sin errores; los destellos aparecen solo al jugar,
+  y los peores al arrancar el partido. Con gldbg 1 (convertir desde el vértice 0) conv sube a 6-8 ms/frame.
+
+### Capturas de la corrida 025 (12:52) — causa de los destellos: DRAW_SPEEDHACK de vitaGL + búfer de conversión reusado
+- Cuadros con destello: todo el césped de un solo color (marrón, rosado), sin líneas, y los jugadores chicos como
+  vistos desde lejos. La presentación se ve limpia; el problema aparece solo al jugar.
+- vitaGL con `DRAW_SPEEDHACK=2` (SAFER) no copia los arrays de cliente de los draws > 0x8000 bytes
+  (`SAFE_DRAW_SIZE_THRESHOLD`, ffp.c): la GPU los lee después. Nuestra conversión GL_FIXED→float escribe siempre en
+  el mismo `conv_buf[slot]` → el draw siguiente del mismo frame pisa los vértices del césped (malla grande) antes de
+  que la GPU los lea. Los draws chicos se copian y se ven bien. Con gldbg 1 (convertir desde el vértice 0) los draws
+  pasan el umbral más seguido: por eso la 025 se vio peor.
+- La 022 "sin speedhacks" nunca recompiló vitaGL: el CMake hacía `test -f libvitaGL.a || make`.
+- Fix: sin `DRAW_SPEEDHACK` en CMakeLists.txt; vitaGL se recompila si cambian los flags (`vendor/vitaGL/.flags`,
+  compilada localmente para que el build del toolkit no la rehaga). gldbg 0 para la corrida 026.
+
+### Corrida 027 (consola, gldbg 0, vitaGL sin DRAW_SPEEDHACK) — los destellos siguen igual
+- Descartado el speedhack como causa (se deja sin él: es más correcto y los FPS no cambiaron, ~30).
+- Fog del partido: GL_EXP, densidad 0.2, color gris (0.8, 0.8, 0.8): no explica marrón ni rosado.
+- `glCopyTexImage2D` del render del partido: captura única (estado +0xec8 de 1 a 2), no son destellos por cuadro.
+- Sonda `PORT_FLASH_PROBE` (port_config.h, código en gles.c): estado del primer draw del césped de cada cuadro
+  (matrices M/P/T, vértice 0, textura, luz/fog/blend/depth) y 4 píxeles del FBO al presentar; registra `FLASH` si
+  ninguno es verde y `OK` cada 300 cuadros para comparar. Corrida 028.
+
+### Corrida 029 (consola) — la sonda no registró nada
+- Sin `FLASH` ni `OK` ni `ENVCOLOR`: en las corridas 027 y 029 el juego nunca puso la unidad 1 en COMBINE. El césped
+  multitextura es `CPlayGround::RenderAdvAlpha` (0x98axx): se dibuja según la distancia de la cámara y
+  `TestSphereInFrustum`, no en todos los partidos. Los destellos siguen sin él → no vienen del combinador.
+- Sonda corregida: ahora se activa con el primer draw en perspectiva de cada cuadro (`P[11] < -0.5`). Corrida 030.
+
+### Corrida 030 (consola) — pantalla vertical en el menú y cuelgue
+- Vertical = IGP de Gameloft (`IGPSendGameInfo` + `setStatusBarOrientation:1`), ya visto en la 012 sin cuelgue.
+- Cuelgue entre 14 s y 20 s (último `vivo` a los 10 s). El IGP dibuja en perspectiva (glFrustumf) → la sonda
+  hacía 4 glReadPixels por cuadro, y en vitaGL cada uno fuerza scene_reset + sceGxmFinish. Ahora es una sola lectura
+  (fila central del FBO, 32 muestras; destello si menos de 4 son verdes). Sin dump: causa no confirmada.
+
+### Corrida 031 (consola) — sin cuelgue con 1 lectura por cuadro; la sonda se gastó en los menús
+- Las 30 líneas FLASH fueron de los menús 3D (fondo amarillo f6e700), nunca verdes. Ahora FLASH = cuadro sin verde
+  justo después de uno verde (máx. 20), con el cuadro anterior (`antes`) para comparar.
+- "Más juegos" (IGP): `CMainMenu::GoNext` (0x1bc58c) y `CNewMainMenu::GoNext` (0x1dbb6c) llaman
+  `SetGameState(9)` (CGSIGP, estado 9 de `CGame::CreateGameState`). Parche en patch.c: nop en los dos → la opción no
+  hace nada. (El ítem 6, Gameloft Live, sigue igual.)
+
+### Corrida 032 (consola) — los destellos son colores de jugador; saque de banda imposible
+- 20 FLASH: la fila central queda de un color de camiseta/piel/pelo (amarillo d3a331, blanco f7f3f7, rojo b23929,
+  rosado d29d9c, naranja c67208, marrón 4a3c29) con las MISMAS matrices de cámara que el cuadro anterior → no es la
+  cámara: un polígono de un jugador se estira sobre la pantalla. El juego hace el skinning en CPU (no usa la paleta).
+  Descartado en vitaGL (sin speedhacks): copia vértices [0, top_idx) e índices de cliente en cada draw.
+- Sonda nueva: registro por draw en perspectiva (puntero/rango de vértices, caja envolvente en espacio objeto,
+  traslación de la modelview, textura); en los 3 primeros destellos vuelca el cuadro anterior y el del destello.
+- Saque de banda: `CTouchScreen::ParseThrowIn` (0x9ec3c) apunta con la inclinación (y×100 fuera de ±43) y lanza con
+  una sacudida (Δ² > 8400, ~0,92 g entre dos lecturas, `UpdateAccelerometer` escala ×100). Con el stick no se llega.
+  `SHAKE <botón>` en controls.txt (input.c, común, opt-in) → una lectura con 2 g extra en z. Este port: SHAKE LTRIGGER.
+
+### Corrida 033 (consola) — 3 destellos registrados: vértices y texturas sanos
+- Los 3 destellos fueron en la presentación del estadio (pantalla negra y 1 fps = el volcado de ~950 líneas).
+- Comparando draw por draw (ptr/rango/textura) el cuadro anterior y el del destello: mismas cajas en espacio objeto
+  (nada gigante), mismas texturas, misma traslación. No se suben texturas en el partido. Pool circular de vitaGL
+  sin speedhack: si se llena, pide memoria nueva (no pisa). Init hace 100 push + 100 pop (balanceado).
+- Pista: en la 031 el mismo draw pasó de escala 3,72 a 15,0 con igual traslación, y en las capturas los jugadores
+  salen diminutos → el 3×3 de alguna matriz cambia. La sonda ahora guarda M y P completas por draw y en cada
+  destello (máx. 8) imprime solo los draws cuya matriz cambió > 10 % respecto del cuadro anterior.
+
+### Corrida 034 (consola) — 8 destellos con matrices completas: nada explota
+- FLASH 1 = corte de cámara legítimo (todos los draws cambian juntos de matriz). FLASH 3-8: la cámara (primer draw)
+  NO cambia; solo cambian billboards/efectos (tex 40, 71) y quads de caja cero. Nada que tape la pantalla.
+- El criterio "cuadro sin verde tras uno verde" también atrapa cortes y tomas del estadio: hace falta ver la imagen.
+- En las capturas de la 025 los nombres y flechas (proyectados por el juego) siguen a los jugadores diminutos →
+  probablemente es la cámara del propio juego la que salta (¿pelota con valores basura, como la velocidad 43285
+  de la 019?). Imports matemáticos (asin, atan2, cos, sin, tanf, floorf, ceilf, rand, __divdi3) van directo a newlib
+  con softfp: sin conversión sospechosa.
+- Sonda: además guarda TGA 160x240 del cuadro anterior y del destello (4 primeros) en logs/flashN[_antes]_<id>.tga.
+
+### Corrida 035 — Causa raíz de los destellos aislada y corregida; restauración de 30/60 fps
+- **Causa raíz descubierta**:
+  - En la corrida 034 se supuso erróneamente que "nada explota" porque solo se inspeccionó el Draw 0 (cámara).
+  - El análisis exhaustivo de todas las matrices de `logs/realsoccer10_034.log` reveló que en los destellos exactos (FLASH 3 al 8):
+    - Draw 57 (`0x833c6f30 m4 n6 tex71`, sombra de jugador) explotaba a `mv[8] = -20123.506` y `mv[10] = 60304.801` (escala de más de 60.000×).
+    - Draw 67, 68, 69 (`0x8339c118 m4 n351 tex70`, mesh/piel de jugador) explotaba a `mv[8] = -16890.514` y `mv[9] = 19142.109`.
+    - Draw 75 (`0x83389c28 m4 n1239 tex67`, camiseta de jugador) explotaba a `mv[8] = -17863.828` y `mv[10] = 30966.287`.
+  - El desensamblado de `CAnimationManager::DrawPlayerShadow` (`0x00027380`) y `CM3DXSkinMesh::DrawSkin` (`0x0000a324`) confirmó que el cálculo de distancia entre pies y huesos produce un desbordamiento aritmético en punto fijo (`rsb r2, r2, #0x10000`), seguido por un desplazamiento `lsl r1, r1, #4` en `CM3DDevice2::PushAndScale` (`0x00003e68`), el cual pasa matrices corruptas a `_glMultMatrixx`.
+  - Esto estiraba la geometría del jugador/sombra a través de todo el frustum durante exactamente un draw call antes del `glPopMatrix`, provocando los destellos de un cuadro en color naranja (sombra), rojo/blanco (camiseta) o negro (botines).
+- **Límites matemáticos verificados**:
+  - Elemento 3×3 de rotación/escala legítimo máximo en juego normal: **2.320**.
+  - Elemento mínimo observado durante un destello: **1.857** (hasta **60.305**).
+  - Umbral de seguridad adoptado: **16.0f** (7× mayor que el máximo legítimo, 100× menor que el glitch).
+- **Solución implementada**:
+  1. **Barrera de draw calls (`is_perspective_3d_exploded`)**: En [source/gles.c](file:///Volumes/TOSHIBA%20EXT/PSVITA%20Develop/Real-Soccer-2010-vita/source/gles.c), se verifica la matriz ModelView antes de `g_glDrawArrays` y `g_glDrawElements` cuando la proyección es 3D (`pm[11] < -0.5f`). Si algún elemento 3×3 excede 16.0f o es NaN/Inf, el draw call corrupto se suprime inmediatamente sin llegar a la GPU.
+  2. **Sanitización de matrices de entrada**: Se protegen `g_glMultMatrixx`, `g_glMultMatrixf`, `g_glLoadMatrixx`, `g_glLoadMatrixf`, `g_glScalef` y `g_glPopMatrix`. Si se intenta multiplicar o cargar una matriz con escala desbordada, se descarta/acota la operación para preservar la integridad del pipeline.
+  3. **Desactivación de la sonda**: `#define PORT_FLASH_PROBE 0` en [source/port_config.h](file:///Volumes/TOSHIBA%20EXT/PSVITA%20Develop/Real-Soccer-2010-vita/source/port_config.h), eliminando `glReadPixels` y recuperando el framerate completo (30/60 fps fluidos sin paradas de GPU).
+- **Verificación**: Build limpio completado con exit code 0 (`psvita-toolkit build`), generando `build/realsoccer10.vpk`.
